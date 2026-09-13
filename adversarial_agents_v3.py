@@ -24,22 +24,18 @@ from trl import PPOTrainer, PPOConfig, AutoModelForCausalLMWithValueHead
 import warnings
 from transformers import logging as hf_logging
 
-# ==========================================
-# SILENCIAR TODOS LOS AVISOS (WARNINGS)
-# ==========================================
+
 warnings.filterwarnings("ignore")
 hf_logging.set_verbosity_error()
 
-# ==========================================
-# FORZAR A PANDAS A MOSTRAR TABLAS ENTERAS
-# ==========================================
+
 pd.set_option('display.max_rows', None)
 pd.set_option('display.max_columns', None)
 pd.set_option('display.width', 2000)
 pd.set_option('display.max_colwidth', None)
 
 # ============================
-# 0. Carga de configuración
+# 0. Auxiliary functions
 # ============================
 
 def fixText(string):
@@ -69,7 +65,7 @@ def readConfig(configFile):
     return rOutput, dataFile, executionMode, model
 
 # ============================
-# 1. Configuración Principal
+# 1. Read config
 # ============================
 
 rOutput, data_file, execution_mode, model = readConfig(sys.argv[1])
@@ -82,7 +78,7 @@ elif execution_mode == "multiclass":
 
 ROUNDS = 1000
 
-# --- Carga y Limpieza de Datos ---
+# --- Data loading and cleaning ---
 df = pd.read_csv(data_file)
 df.columns = df.columns.str.strip()
 df.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -139,7 +135,7 @@ def safe_extract_json(text, fallback_key="prediction"):
     except: return {}
 
 # ============================
-# 2. Inicialización de Agentes
+# 2. Agent initialization
 # ============================
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 if tokenizer.pad_token is None: tokenizer.pad_token = tokenizer.eos_token
@@ -148,20 +144,19 @@ bnb_config = BitsAndBytesConfig(
     load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_quant_type="nf4"
 )
 
-# --- OPTIMIZACIÓN DE HIPERPARÁMETROS PPO ---
+# --- Optimization of PPO parameters ---
 config_ppo = PPOConfig(
     model_name=MODEL_NAME,
     learning_rate=1.41e-5,          
-    batch_size=4,                   # Aumentado para estabilidad de gradientes
-    mini_batch_size=1,              # Mantenido en 1 para que no consuma VRAM extra
-    gradient_accumulation_steps=4,  # Acumulamos 4 pasos antes de aplicar cambios
+    batch_size=4,                   
+    mini_batch_size=1,              
+    gradient_accumulation_steps=4,  
     optimize_cuda_cache=True,       
     early_stopping=False,
     target_kl=0.1,                  
 )
 
 def create_agent(name):
-    # 1. Cargar el modelo base normal
     base_model = AutoModelForCausalLM.from_pretrained(
         MODEL_NAME, 
         torch_dtype=torch.bfloat16, 
@@ -169,8 +164,7 @@ def create_agent(name):
         trust_remote_code=True
     )
 
-    # 2. EL BUSCADOR ESPECÍFICO PARA GEMMA
-    # Si es un modelo moderno, buscará en text_config
+
     if hasattr(base_model.config, "hidden_size"):
         h_size = base_model.config.hidden_size
     elif hasattr(base_model.config, "text_config") and hasattr(base_model.config.text_config, "hidden_size"):
@@ -180,10 +174,10 @@ def create_agent(name):
     elif hasattr(base_model.config, "d_model"):
         h_size = base_model.config.d_model
     else:
-        # Fallback de seguridad por si acaso
+
         h_size = getattr(base_model.config, "word_embed_proj_dim", 2048)
 
-    # 3. Preparar LoRA
+
     lora_config = LoraConfig(
         r=16,
         lora_alpha=32,
@@ -194,16 +188,14 @@ def create_agent(name):
     )
     lora_config.autocast_adapter_dtype = False 
 
-    # 4. Envolver en PEFT
+
     peft_model = get_peft_model(base_model, lora_config)
 
-    # 5. EL PARCHE PARA TRL
-    # Restauramos la configuración original
+
     peft_model.config = base_model.config
-    # Engañamos a TRL inyectando el "hidden_size" del texto en la raíz general
+
     peft_model.config.hidden_size = h_size
 
-    # 6. Construir PPO
     ppo_model = AutoModelForCausalLMWithValueHead(peft_model)
     ppo_model.is_peft_model = True
 
@@ -213,7 +205,7 @@ ppo_atk = create_agent("attacker")
 ppo_def = create_agent("defender")
 
 # ============================
-# 3. Nodos del Grafo (LangGraph)
+# 3. Graph nodes
 # ============================
 class AgentState(TypedDict):
     current_log: dict
@@ -314,12 +306,12 @@ workflow.add_edge("evaluator", END)
 app = workflow.compile()
 
 # ============================
-# 4. Entrenamiento RL y Reporte
+# 4. Reinforcement learning
 # ============================
 print(f"SISTEMA INICIADO | Modelo: {MODEL_NAME} | Modo: {'Binario' if BINARY_MODE else 'Multiclase'}\n")
 print(f"Iniciando RL con {ROUNDS} muestras aleatorias del conjunto de TEST (no vistas previamente)...")
 
-# --- NUEVO: Listas para acumular lotes (Batches) ---
+
 BATCH_SIZE = 4
 batch_queries_atk, batch_resps_atk, batch_rewards_atk = [], [], []
 batch_queries_def, batch_resps_def, batch_rewards_def = [], [], []
@@ -336,7 +328,7 @@ for i in range(ROUNDS):
     y_true_hist.append(state['label'])
     y_pred_hist.append(state['llm_label_pred'])
     
-    # Acumulamos los datos generados en este turno
+
     if state["atk_data"]["query"] is not None:
         batch_queries_atk.append(state["atk_data"]["query"].squeeze(0))
         batch_resps_atk.append(state["atk_data"]["resp"].squeeze(0))
@@ -346,7 +338,7 @@ for i in range(ROUNDS):
     batch_resps_def.append(state["def_data"]["resp"].squeeze(0))
     batch_rewards_def.append(torch.tensor(state["reward_def"], dtype=torch.float))
 
-    # --- ENTRENAMIENTO ATACANTE (Solo si ha acumulado 4 ataques) ---
+
     if len(batch_queries_atk) == BATCH_SIZE:
         device_atk = ppo_atk.accelerator.device
         b_q_atk = [q.to(device_atk) for q in batch_queries_atk]
@@ -355,16 +347,16 @@ for i in range(ROUNDS):
         
         ppo_atk.step(b_q_atk, b_r_atk, b_rw_atk)
         
-        # Vaciamos sus listas
+
         batch_queries_atk.clear()
         batch_resps_atk.clear()
         batch_rewards_atk.clear()
         
-        # Limpieza de memoria exclusiva para el atacante
+
         gc.collect()
         torch.cuda.empty_cache()
 
-    # --- ENTRENAMIENTO DEFENSOR (Cada 4 rondas de cualquier tráfico) ---
+
     if len(batch_queries_def) == BATCH_SIZE:
         device_def = ppo_def.accelerator.device
         b_q_def = [q.to(device_def) for q in batch_queries_def]
@@ -373,17 +365,17 @@ for i in range(ROUNDS):
         
         ppo_def.step(b_q_def, b_r_def, b_rw_def)
         
-        # Vaciamos sus listas
+
         batch_queries_def.clear()
         batch_resps_def.clear()
         batch_rewards_def.clear()
         
-        # Limpieza de memoria exclusiva para el defensor
+
         gc.collect()
         torch.cuda.empty_cache()
 
-# --- Reporte Final ---
-print(f"\n{'='*60}\n MATRIZ DE CONFUSIÓN (DEFENSOR LLM)\n{'='*60}")
+
+print(f"\n{'='*60}\n CONFUSION MATRIX (DEFENDER LLM)\n{'='*60}")
 cm = confusion_matrix(y_true_hist, y_pred_hist, labels=CLASS_NAMES)
 df_cm = pd.DataFrame(cm, index=[f"Real_{c}" for c in CLASS_NAMES], columns=[f"Pred_{c}" for c in CLASS_NAMES])
 print(df_cm)
@@ -392,7 +384,7 @@ print("\nInforme de Clasificación:")
 reporte_clas = classification_report(y_true_hist, y_pred_hist, labels=CLASS_NAMES, zero_division=0)
 print(reporte_clas)
 
-# --- NUEVO: Guardar los resultados en el archivo rOutput ---
+
 try:
     with open(rOutput, "w", encoding="utf-8") as f_out:
         f_out.write(f"{'='*60}\n MATRIZ DE CONFUSIÓN (DEFENSOR LLM)\n{'='*60}\n")
